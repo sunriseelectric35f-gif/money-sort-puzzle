@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.expo/
+ios/
+android/
+*.ipa
+*.xcarchive
+design/pinterest2/

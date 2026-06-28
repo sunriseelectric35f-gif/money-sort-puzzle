@@ -1,0 +1,98 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build Unsigned IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Expo
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+        continue-on-error: true  # token optional for local build
+
+      - name: Install CocoaPods
+        run: |
+          gem install cocoapods --no-document 2>&1 | tail -3
+          pod --version
+
+      - name: Generate native iOS project
+        run: |
+          npx expo prebuild --platform ios --clean 2>&1
+
+      - name: Install CocoaPods deps
+        working-directory: ios
+        run: |
+          pod install --repo-update 2>&1 | tail -20
+
+      - name: Build unsigned IPA (xcodebuild)
+        run: |
+          cd ios
+
+          # Determine scheme — use -d so ls prints the dir itself, not its contents
+          SCHEME=$(ls -d *.xcworkspace | head -1 | sed 's/.xcworkspace//')
+          echo "Scheme: $SCHEME"
+
+          # Build archive (CODE_SIGNING_ALLOWED=NO → unsigned)
+          xcodebuild archive \
+            -workspace "${SCHEME}.xcworkspace" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath "/tmp/${SCHEME}.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE="" \
+            -allowProvisioningUpdates \
+            2>&1 | tail -40
+
+      - name: Package unsigned IPA
+        run: |
+          # -d: list the dir itself, not its contents
+          SCHEME=$(ls -d ios/*.xcworkspace | head -1 | sed 's|ios/||;s/.xcworkspace//')
+          ARCHIVE="/tmp/${SCHEME}.xcarchive"
+
+          # Export as unsigned
+          mkdir -p /tmp/ipa_export
+          cp -r "${ARCHIVE}/Products/Applications" /tmp/ipa_export/Payload
+          cd /tmp/ipa_export
+          zip -r "${SCHEME}-unsigned.ipa" Payload/
+          mv "${SCHEME}-unsigned.ipa" $GITHUB_WORKSPACE/
+
+          echo "IPA_NAME=${SCHEME}-unsigned.ipa" >> $GITHUB_ENV
+          ls -lh "${SCHEME}-unsigned.ipa" || ls -lh $GITHUB_WORKSPACE/*.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: '*.ipa'
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## ✅ Unsigned IPA Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download from the **Artifacts** section above." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To sideload: use AltStore, Sideloadly, or iOS App Installer (requires free Apple ID — 7-day expiry)." >> $GITHUB_STEP_SUMMARY
+          echo "For permanent install: sign with your provisioning profile." >> $GITHUB_STEP_SUMMARY
