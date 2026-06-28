@@ -10,6 +10,13 @@ jobs:
     name: Build Unsigned IPA
     runs-on: macos-latest
 
+    # Expo SDK56 ships a *prebuilt* React Native Core (RCT_USE_PREBUILT_RNCORE=1)
+    # whose per-configuration "Build … xcframework" / "Replace React Native Core"
+    # script phases reliably fail under `xcodebuild archive` in CI (exit 65).
+    # Forcing source builds removes those switch scripts and archives cleanly.
+    env:
+      RCT_USE_PREBUILT_RNCORE: '0'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
