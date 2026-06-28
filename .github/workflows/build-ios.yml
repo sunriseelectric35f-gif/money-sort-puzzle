@@ -51,6 +51,34 @@ jobs:
         run: |
           pod install --repo-update 2>&1 | tail -20
 
+      # Xcode 16.4 on macos-latest ships Swift 6.1.0, but two Expo SPM manifests
+      # (expo-modules-jsi, @expo/expo-modules-macros-plugin) declare
+      # `// swift-tools-version: 6.2`. SwiftPM then refuses to resolve them:
+      #   "package 'apple' is using Swift tools version 6.2.0 but the installed
+      #    version is 6.1.0 → Could not resolve package dependencies".
+      # Neither manifest uses 6.2-exclusive PackageDescription API — the gate is
+      # just a version number — and the two `.enableUpcomingFeature(...)` flags
+      # that target 6.2 are ignored-with-warning (not errors) on 6.1. Lowering the
+      # gate lets the installed toolchain resolve them on the proven Xcode 16.4,
+      # instead of migrating the entire RN/Expo archive to a brand-new Swift 6.2
+      # toolchain. node_modules is recreated by `npm ci` each run, so this must
+      # run here in CI.
+      - name: Lower Expo SPM tools-version gate (6.2 -> 6.1 for Swift 6.1.0)
+        run: |
+          set -eo pipefail
+          patched=0
+          while IFS= read -r f; do
+            if head -1 "$f" | grep -q 'swift-tools-version:[[:space:]]*6\.2'; then
+              sed -i.bak '1s/\(swift-tools-version:[[:space:]]*\)6\.2/\16.1/' "$f"
+              echo "patched: $f -> $(head -1 "$f")"
+              patched=$((patched+1))
+            fi
+          done < <(find node_modules -name Package.swift 2>/dev/null)
+          echo "Lowered $patched Expo SPM manifest(s) from tools-version 6.2 -> 6.1"
+          if [ "$patched" -eq 0 ]; then
+            echo "::warning::No 6.2 manifests found — Expo may have changed the gate; verify Swift toolchain compatibility"
+          fi
+
       # SDK56 ships ExpoModulesJSI as an *always-prebuilt* Swift/C++ xcframework.
       # Its podspec script phase runs a nested `xcodebuild build -quiet` DURING
       # `xcodebuild archive`; that nested build is fragile (relies on resolved
