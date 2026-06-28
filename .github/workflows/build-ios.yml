@@ -46,40 +46,60 @@ jobs:
 
       - name: Build unsigned IPA (xcodebuild)
         run: |
+          set -eo pipefail
           cd ios
 
           # Determine scheme — use -d so ls prints the dir itself, not its contents
           SCHEME=$(ls -d *.xcworkspace | head -1 | sed 's/.xcworkspace//')
           echo "Scheme: $SCHEME"
 
-          # Build archive (CODE_SIGNING_ALLOWED=NO → unsigned)
+          # Build archive (CODE_SIGNING_ALLOWED=NO → unsigned).
+          # pipefail ensures a real xcodebuild failure fails this step instead of
+          # being masked by the trailing `tee`.
           xcodebuild archive \
             -workspace "${SCHEME}.xcworkspace" \
             -scheme "$SCHEME" \
             -configuration Release \
             -archivePath "/tmp/${SCHEME}.xcarchive" \
+            -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             PROVISIONING_PROFILE="" \
-            -allowProvisioningUpdates \
-            2>&1 | tail -40
+            2>&1 | tee /tmp/xcodebuild.log | tail -40
+
+          echo "=== archive tree ==="
+          ls -lR "/tmp/${SCHEME}.xcarchive" 2>&1 | head -40 || true
 
       - name: Package unsigned IPA
         run: |
-          # -d: list the dir itself, not its contents
+          set -eo pipefail
           SCHEME=$(ls -d ios/*.xcworkspace | head -1 | sed 's|ios/||;s/.xcworkspace//')
           ARCHIVE="/tmp/${SCHEME}.xcarchive"
 
-          # Export as unsigned
-          mkdir -p /tmp/ipa_export
-          cp -r "${ARCHIVE}/Products/Applications" /tmp/ipa_export/Payload
-          cd /tmp/ipa_export
-          zip -r "${SCHEME}-unsigned.ipa" Payload/
-          mv "${SCHEME}-unsigned.ipa" $GITHUB_WORKSPACE/
+          # Locate the built .app robustly — prefer the archive, then fall back to
+          # any DerivedData/build product. Avoids the brittle hardcoded
+          # Products/Applications path that breaks when xcodebuild lays it elsewhere.
+          APP=$(find "$ARCHIVE" -type d -name '*.app' 2>/dev/null | head -1)
+          if [ -z "$APP" ]; then
+            echo "No .app in archive; searching build dirs…"
+            APP=$(find /tmp ~/Library/Developer/Xcode/DerivedData ios -type d -name '*.app' 2>/dev/null | grep -i release | head -1)
+          fi
+          if [ -z "$APP" ]; then
+            echo "::error::Could not locate a built .app bundle"
+            find "$ARCHIVE" -maxdepth 4 2>/dev/null | head -60
+            exit 1
+          fi
+          echo "Found app: $APP"
 
-          echo "IPA_NAME=${SCHEME}-unsigned.ipa" >> $GITHUB_ENV
-          ls -lh "${SCHEME}-unsigned.ipa" || ls -lh $GITHUB_WORKSPACE/*.ipa
+          rm -rf /tmp/ipa_export && mkdir -p /tmp/ipa_export/Payload
+          cp -R "$APP" /tmp/ipa_export/Payload/
+          cd /tmp/ipa_export
+          zip -qry "${SCHEME}-unsigned.ipa" Payload/
+          mv "${SCHEME}-unsigned.ipa" "$GITHUB_WORKSPACE/"
+
+          echo "IPA_NAME=${SCHEME}-unsigned.ipa" >> "$GITHUB_ENV"
+          ls -lh "$GITHUB_WORKSPACE/${SCHEME}-unsigned.ipa"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
