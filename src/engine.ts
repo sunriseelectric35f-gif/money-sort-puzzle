@@ -1,14 +1,15 @@
-// Money Sort: Merge Puzzle — game engine
-// Ball-Sort core: move the top run of matching notes between wallets.
-// A wallet filled with one uniform denomination (== capacity) BANKS.
-// Pure reducers (immutable) — App.tsx drives via setGame(g => fn(g)).
-import { GameState, Wallet, Move, RawLevel } from './types';
-import { DENOM_VALUE } from './items';
+// Money Sort: Merge Puzzle — game engine (MERGE-SORT hybrid)
+// Pour the top run of equal-tier notes between wallets. When a wallet
+// accumulates MERGE_N contiguous notes of a tier t (< TOP), they FUSE into one
+// note of tier t+1 (cascades upward). A wallet that is full & uniform BANKS.
+// Pure reducers (immutable) — screens drive via setGame(g => fn(g)).
+import { GameState, Wallet, Move, RawLevel, MergeFx } from './types';
+import { tierValue, TOP_TIER } from './items';
 import levelsRaw from './levels.json';
 
 const LEVELS = levelsRaw as unknown as RawLevel[];
 export const LEVEL_COUNT = LEVELS.length;
-export const BASE_FREE_WALLETS = 0; // extra wallets are a booster, not default
+export const MAX_FREE_WALLETS = 2;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function clone(wallets: Wallet[]): Wallet[] {
@@ -29,21 +30,47 @@ function isUniform(notes: number[]): boolean {
   return notes.length <= 1 || notes.every(n => n === notes[0]);
 }
 
-// A wallet "banks" when it is full AND uniform.
-function checkBank(w: Wallet, capacity: number): boolean {
-  return !w.banked && w.notes.length === capacity && isUniform(w.notes);
+// Fuse MERGE_N contiguous top notes of tier t (< TOP) into one tier t+1.
+// Mutates `notes`, returns the number of cascade steps that fired.
+function cascade(notes: number[], mergeN: number): number {
+  let chain = 0;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    if (notes.length >= mergeN) {
+      const t = notes[notes.length - 1];
+      if (t < TOP_TIER) {
+        let run = 0;
+        for (let k = notes.length - 1; k >= 0; k--) {
+          if (notes[k] === t) run++; else break;
+        }
+        if (run >= mergeN) {
+          notes.splice(notes.length - mergeN, mergeN);
+          notes.push(t + 1);
+          chain++;
+          changed = true;
+        }
+      }
+    }
+  }
+  return chain;
+}
+
+// A wallet is "sorted" when it's empty or holds one tier only. This is the
+// win predicate per-wallet and matches the generator/BFS solver contract.
+function isSorted(notes: number[]): boolean {
+  return notes.length === 0 || isUniform(notes);
 }
 
 export function canMove(g: GameState, from: number, to: number): boolean {
   if (from === to) return false;
   const wf = g.wallets[from], wt = g.wallets[to];
-  if (!wf || !wt || wf.banked || wt.banked) return false;
+  if (!wf || !wt) return false;
   if (wf.notes.length === 0) return false;
-  if (isUniform(wf.notes) && wf.notes.length === g.capacity) return false; // already done
+  if (isUniform(wf.notes) && wf.notes.length === g.capacity) return false; // locked: uniform & full
   if (wt.notes.length >= g.capacity) return false;
   if (wt.notes.length === 0) {
-    // disallow pouring a fully-uniform stack into empty (no progress)
-    return !isUniform(wf.notes);
+    return !isUniform(wf.notes); // no progress pouring a uniform stack into empty
   }
   const { val } = topRun(wf.notes);
   return wt.notes[wt.notes.length - 1] === val;
@@ -69,11 +96,11 @@ export function initLevel(levelIndex: number, vault = 0): GameState {
   const wallets: Wallet[] = lvl.wallets.map((notes, index) => ({
     index, notes: [...notes], banked: false,
   }));
-  // bank any wallets that already start complete (rare)
-  wallets.forEach(w => { if (checkBank(w, lvl.capacity)) w.banked = true; });
   return {
     levelIndex,
     capacity: lvl.capacity,
+    tiers: lvl.tiers,
+    mergeN: lvl.mergeN,
     wallets,
     selected: null,
     moves: 0,
@@ -88,12 +115,15 @@ export function initLevel(levelIndex: number, vault = 0): GameState {
     hintMove: null,
     freeWalletsUsed: 0,
     hintsUsed: 0,
+    lastMerges: [],
+    lastBank: null,
   };
 }
 
 // ── win/stars ────────────────────────────────────────────────────────────────
+// Win = every wallet empty or holding a single denomination (matches solver).
 function isWin(g: GameState): boolean {
-  return g.wallets.every(w => w.notes.length === 0 || (isUniform(w.notes) && (w.banked || w.notes.length === g.capacity)));
+  return g.wallets.every(w => isSorted(w.notes));
 }
 
 function starsFor(moves: number, par: number): number {
@@ -103,30 +133,25 @@ function starsFor(moves: number, par: number): number {
 }
 
 // ── core interaction: tap a wallet ───────────────────────────────────────────
-// First tap selects a source; second tap attempts to pour into target.
 export function tapWallet(g: GameState, index: number): GameState {
   if (g.phase !== 'playing') return g;
   const w = g.wallets[index];
   if (!w) return g;
 
-  // no source selected yet
   if (g.selected === null) {
-    if (w.notes.length === 0 || w.banked) return g; // nothing to pick
+    if (w.notes.length === 0) return g;
     if (isUniform(w.notes) && w.notes.length === g.capacity) return g;
-    return { ...g, selected: index, hintMove: null };
+    return { ...g, selected: index, hintMove: null, lastMerges: [], lastBank: null };
   }
 
-  // tapping the same wallet deselects
   if (g.selected === index) {
     return { ...g, selected: null };
   }
 
-  // attempt move selected -> index
   if (canMove(g, g.selected, index)) {
     return applyMove(g, g.selected, index);
   }
-  // invalid target: re-select if it has notes, else clear
-  if (w.notes.length > 0 && !w.banked && !(isUniform(w.notes) && w.notes.length === g.capacity)) {
+  if (w.notes.length > 0 && !(isUniform(w.notes) && w.notes.length === g.capacity)) {
     return { ...g, selected: index };
   }
   return { ...g, selected: null };
@@ -145,19 +170,34 @@ export function applyMove(g: GameState, from: number, to: number): GameState {
   for (let n = 0; n < k; n++) dst.notes.push(val as number);
   src.notes.splice(src.notes.length - k, k);
 
-  // bank check on destination
+  // merge cascade on destination
+  const chain = cascade(dst.notes, g.mergeN);
+  const merges: MergeFx[] = [];
+  if (chain > 0) {
+    merges.push({ wallet: to, toTier: dst.notes[dst.notes.length - 1], chain });
+  }
+
+  // banking + scoring. A wallet "banks" (locks + pays out immediately) when it
+  // becomes uniform AND full. Sorted-but-not-full wallets settle at win.
   let score = g.score;
   let vault = g.vault;
   let combo = g.combo;
-  if (checkBank(dst, g.capacity)) {
+  let lastBank: number | null = null;
+  const dstBanks = isUniform(dst.notes) && dst.notes.length === g.capacity;
+  if (dstBanks) {
     dst.banked = true;
-    const cash = DENOM_VALUE[(val as number) % DENOM_VALUE.length] * g.capacity;
+    lastBank = to;
+    const cash = tierValue(dst.notes[0]) * dst.notes.length;
     combo = combo + 1;
-    const gain = cash * (1 + (combo - 1) * 0.5); // combo multiplier on consecutive banks
+    const gain = cash * (1 + (combo - 1) * 0.5);
     score += Math.round(gain);
     vault += cash;
-  } else {
-    combo = 0; // a non-banking move breaks the combo chain
+  } else if (chain === 0) {
+    combo = 0; // a plain non-merge non-bank move breaks the chain
+  }
+  // merges themselves award a small bonus + keep combo alive
+  if (chain > 0) {
+    score += chain * 25;
   }
 
   let ng: GameState = {
@@ -169,19 +209,33 @@ export function applyMove(g: GameState, from: number, to: number): GameState {
     vault,
     combo,
     hintMove: null,
-    history: [...g.history, snapshot].slice(-50),
-    bankedHistory: [...g.bankedHistory, bankedSnap].slice(-50),
+    lastMerges: merges,
+    lastBank,
+    history: [...g.history, snapshot].slice(-80),
+    bankedHistory: [...g.bankedHistory, bankedSnap].slice(-80),
   };
 
   if (isWin(ng)) {
+    // settle every sorted wallet that didn't formally bank during play
+    let settled = ng.vault;
+    let settledScore = ng.score;
+    const finalWallets = ng.wallets.map(w => {
+      if (!w.banked && w.notes.length > 0 && isUniform(w.notes)) {
+        const cash = tierValue(w.notes[0]) * w.notes.length;
+        settled += cash;
+        settledScore += cash;
+        return { ...w, banked: true };
+      }
+      return w;
+    });
     const stars = starsFor(ng.moves, ng.par);
-    const clearBonus = Math.round((ng.par / Math.max(ng.moves, 1)) * 200);
-    ng = { ...ng, phase: 'victory', stars, score: ng.score + clearBonus };
+    const clearBonus = Math.round((ng.par / Math.max(ng.moves, 1)) * 250);
+    ng = { ...ng, wallets: finalWallets, vault: settled, phase: 'victory', stars, score: settledScore + clearBonus };
   }
   return ng;
 }
 
-// ── boosters / differentiators ───────────────────────────────────────────────
+// ── boosters ─────────────────────────────────────────────────────────────────
 export function undo(g: GameState): GameState {
   if (g.history.length === 0 || g.phase !== 'playing') return g;
   const prev = g.history[g.history.length - 1];
@@ -198,27 +252,47 @@ export function undo(g: GameState): GameState {
     bankedHistory: g.bankedHistory.slice(0, -1),
     hintMove: null,
     combo: 0,
+    lastMerges: [],
+    lastBank: null,
   };
 }
 
-// +Wallet booster — append a temporary empty wallet to escape tight boards.
 export function addFreeWallet(g: GameState): GameState {
-  if (g.phase !== 'playing' || g.freeWalletsUsed >= 2) return g;
+  if (g.phase !== 'playing' || g.freeWalletsUsed >= MAX_FREE_WALLETS) return g;
   const wallets = clone(g.wallets);
   wallets.push({ index: wallets.length, notes: [], banked: false });
   return { ...g, wallets, freeWalletsUsed: g.freeWalletsUsed + 1, hintMove: null };
 }
 
-// ── BFS solver — powers Smart Hint AND guarantees levels are solvable ─────────
+// ── BFS solver — powers Smart Hint AND verifies levels ───────────────────────
 type SState = number[][];
 
-function serialize(s: SState): string {
+function sSerialize(s: SState): string {
   return s.map(w => w.join(',')).sort().join('|');
 }
-function sWin(s: SState, cap: number): boolean {
-  // Ball-sort win: each wallet empty OR full of a single denomination.
-  // A partial-uniform wallet (color split across tubes) is NOT solved.
-  return s.every(w => w.length === 0 || (w.length === cap && w.every(n => n === w[0])));
+function sWin(s: SState): boolean {
+  // each wallet empty OR uniform (merge mechanic: completion = uniform stack)
+  return s.every(w => w.length === 0 || w.every(n => n === w[0]));
+}
+function sCascade(notes: number[], mergeN: number): void {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    if (notes.length >= mergeN) {
+      const t = notes[notes.length - 1];
+      if (t < TOP_TIER) {
+        let run = 0;
+        for (let k = notes.length - 1; k >= 0; k--) {
+          if (notes[k] === t) run++; else break;
+        }
+        if (run >= mergeN) {
+          notes.splice(notes.length - mergeN, mergeN);
+          notes.push(t + 1);
+          changed = true;
+        }
+      }
+    }
+  }
 }
 function sLegal(s: SState, cap: number): Array<[number, number]> {
   const moves: Array<[number, number]> = [];
@@ -238,7 +312,7 @@ function sLegal(s: SState, cap: number): Array<[number, number]> {
   }
   return moves;
 }
-function sApply(s: SState, i: number, j: number, cap: number): SState {
+function sApply(s: SState, i: number, j: number, cap: number, mergeN: number): SState {
   const ns = s.map(w => [...w]);
   const t = ns[i][ns[i].length - 1];
   let run = 0;
@@ -246,17 +320,15 @@ function sApply(s: SState, i: number, j: number, cap: number): SState {
   const space = cap - ns[j].length;
   const k = Math.min(run, space);
   for (let n = 0; n < k; n++) { ns[j].push(t); ns[i].pop(); }
+  sCascade(ns[j], mergeN);
   return ns;
 }
 
-// BFS for the next move on a shortest solution path. Bounded for runtime safety.
-export function solveNext(g: GameState, nodeCap = 60000): Move | null {
+export function solveNext(g: GameState, nodeCap = 80000): Move | null {
   const start: SState = g.wallets.map(w => [...w.notes]);
-  const cap = g.capacity;
-  if (sWin(start, cap)) return null;
-  const startKey = serialize(start);
-  const seen = new Set([startKey]);
-  // queue holds [state, firstMove]
+  const cap = g.capacity, mergeN = g.mergeN;
+  if (sWin(start)) return null;
+  const seen = new Set([sSerialize(start)]);
   const q: Array<[SState, [number, number] | null]> = [[start, null]];
   let nodes = 0;
   while (q.length) {
@@ -264,11 +336,11 @@ export function solveNext(g: GameState, nodeCap = 60000): Move | null {
     nodes++;
     if (nodes > nodeCap) break;
     for (const [i, j] of sLegal(cur, cap)) {
-      const nxt = sApply(cur, i, j, cap);
-      const key = serialize(nxt);
+      const nxt = sApply(cur, i, j, cap, mergeN);
+      const key = sSerialize(nxt);
       if (seen.has(key)) continue;
       const fm = first ?? [i, j];
-      if (sWin(nxt, cap)) {
+      if (sWin(nxt)) {
         const [a, b] = fm;
         const { run } = topRun(g.wallets[a].notes);
         return { from: a, to: b, count: Math.min(run, cap - g.wallets[b].notes.length) };
@@ -277,7 +349,6 @@ export function solveNext(g: GameState, nodeCap = 60000): Move | null {
       q.push([nxt, fm]);
     }
   }
-  // fallback: any legal move that makes progress
   const lm = legalMoves(g);
   return lm.length ? lm[0] : null;
 }
@@ -286,4 +357,9 @@ export function hint(g: GameState): GameState {
   if (g.phase !== 'playing') return g;
   const m = solveNext(g);
   return { ...g, hintMove: m, selected: m ? m.from : g.selected, hintsUsed: g.hintsUsed + 1 };
+}
+
+// Expose level meta for the level-select map.
+export function levelMeta(i: number): RawLevel {
+  return LEVELS[i % LEVELS.length];
 }
