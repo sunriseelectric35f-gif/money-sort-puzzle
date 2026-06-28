@@ -8,7 +8,10 @@ on:
 jobs:
   build-ios:
     name: Build Unsigned IPA
-    runs-on: macos-latest
+    # macos-15 (Sequoia) ships Xcode 26.x → Swift 6.2, which the Expo SDK56
+    # ExpoModulesJSI source REQUIRES (see the Xcode-select step below). macos-14
+    # caps at Xcode 16.4 / Swift 6.1.0 and cannot compile that source.
+    runs-on: macos-15
 
     # Expo SDK56 ships a *prebuilt* React Native Core (RCT_USE_PREBUILT_RNCORE=1)
     # whose per-configuration "Build … xcframework" / "Replace React Native Core"
@@ -20,6 +23,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ExpoModulesJSI (SDK56) Swift source uses Swift 6.2 *compiler* features —
+      # `weak let` stored properties and trailing-comma syntax — that DO NOT parse
+      # on the Swift 6.1.0 compiler in Xcode 16.4. Earlier we tried lowering the
+      # SPM `swift-tools-version` gate 6.2→6.1; that got past SwiftPM *resolution*
+      # but the *source* still failed to compile:
+      #   JavaScriptRuntime.swift:330:5: error: unexpected ',' separator
+      #   HostFunctionContext.swift:3:12: error: 'weak' must be a mutable variable
+      #   …(15× 'weak let' errors across JavaScript*.swift)
+      # The only correct fix is to build with the Swift 6.2 toolchain. The runner
+      # default (xcode-select -p) is often the older Xcode, so we select the newest
+      # Xcode explicitly here — making *every* subsequent xcodebuild step (the JSI
+      # prebuild AND the archive) use Swift 6.2 — and fail fast with a clear message
+      # if the runner somehow lacks it (instead of burning ~10 min to hit the same
+      # compile error deep in the archive).
+      - name: Select newest Xcode (Swift 6.2 toolchain)
+        run: |
+          set -eo pipefail
+          echo "Installed Xcodes:"; ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then
+            XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          fi
+          if [ -z "$XC" ]; then echo "::error::No Xcode found on runner"; exit 1; fi
+          echo "Selecting: $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+          swift --version
+          SWIFT_VER=$(swift --version 2>&1 | grep -oE 'Swift version [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1)
+          echo "Active Swift toolchain: ${SWIFT_VER:-unknown}"
+          CUR_MAJ=${SWIFT_VER%%.*}; CUR_MIN=${SWIFT_VER##*.}
+          if [ -z "$SWIFT_VER" ] || [ "$CUR_MAJ" -lt 6 ] || { [ "$CUR_MAJ" -eq 6 ] && [ "$CUR_MIN" -lt 2 ]; }; then
+            echo "::error::Swift ${SWIFT_VER:-?} < 6.2 — ExpoModulesJSI (SDK56) cannot compile. Runner needs Xcode 26+."
+            exit 1
+          fi
+          echo "✓ Swift $SWIFT_VER satisfies the >= 6.2 requirement"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -51,34 +90,6 @@ jobs:
         run: |
           pod install --repo-update 2>&1 | tail -20
 
-      # Xcode 16.4 on macos-latest ships Swift 6.1.0, but two Expo SPM manifests
-      # (expo-modules-jsi, @expo/expo-modules-macros-plugin) declare
-      # `// swift-tools-version: 6.2`. SwiftPM then refuses to resolve them:
-      #   "package 'apple' is using Swift tools version 6.2.0 but the installed
-      #    version is 6.1.0 → Could not resolve package dependencies".
-      # Neither manifest uses 6.2-exclusive PackageDescription API — the gate is
-      # just a version number — and the two `.enableUpcomingFeature(...)` flags
-      # that target 6.2 are ignored-with-warning (not errors) on 6.1. Lowering the
-      # gate lets the installed toolchain resolve them on the proven Xcode 16.4,
-      # instead of migrating the entire RN/Expo archive to a brand-new Swift 6.2
-      # toolchain. node_modules is recreated by `npm ci` each run, so this must
-      # run here in CI.
-      - name: Lower Expo SPM tools-version gate (6.2 -> 6.1 for Swift 6.1.0)
-        run: |
-          set -eo pipefail
-          patched=0
-          while IFS= read -r f; do
-            if head -1 "$f" | grep -q 'swift-tools-version:[[:space:]]*6\.2'; then
-              sed -i.bak '1s/\(swift-tools-version:[[:space:]]*\)6\.2/\16.1/' "$f"
-              echo "patched: $f -> $(head -1 "$f")"
-              patched=$((patched+1))
-            fi
-          done < <(find node_modules -name Package.swift 2>/dev/null)
-          echo "Lowered $patched Expo SPM manifest(s) from tools-version 6.2 -> 6.1"
-          if [ "$patched" -eq 0 ]; then
-            echo "::warning::No 6.2 manifests found — Expo may have changed the gate; verify Swift toolchain compatibility"
-          fi
-
       # SDK56 ships ExpoModulesJSI as an *always-prebuilt* Swift/C++ xcframework.
       # Its podspec script phase runs a nested `xcodebuild build -quiet` DURING
       # `xcodebuild archive`; that nested build is fragile (relies on resolved
@@ -87,7 +98,7 @@ jobs:
       # HERE, in its own step, with `-quiet` stripped so any genuine error is
       # visible. The script hashes its inputs, so the archive's script phase then
       # finds the slice up-to-date and becomes a no-op — removing archive-time
-      # fragility entirely.
+      # fragility entirely. DEVELOPER_DIR inherits the Swift 6.2 Xcode selected above.
       - name: Prebuild ExpoModulesJSI xcframework (verbose, device slice)
         working-directory: ios
         run: |
