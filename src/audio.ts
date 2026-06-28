@@ -4,9 +4,11 @@
 // so there are no binary asset files to bundle or path to break.
 import { Platform } from 'react-native';
 
-let Audio: any = null;
+// expo-audio is the SDK 56 replacement for the deprecated expo-av (which no
+// longer compiles — its EXAV.h imports the removed ExpoModulesCore/EXEventEmitter.h).
+let ExpoAudio: any = null;
 let Haptics: any = null;
-try { Audio = require('expo-av').Audio; } catch (e) { Audio = null; }
+try { ExpoAudio = require('expo-audio'); } catch (e) { ExpoAudio = null; }
 try { Haptics = require('expo-haptics'); } catch (e) { Haptics = null; }
 
 // ── WAV tone generator (PCM 16-bit mono) ─────────────────────────────────────
@@ -63,9 +65,12 @@ const pool: Record<string, any> = {};
 let ready = false;
 
 export async function initAudio() {
-  if (!Audio || ready) return;
+  if (!ExpoAudio || ready) return;
   try {
-    await Audio.setAudioModeAsync({ playsInSilentModeIOS: true, staysActiveInBackground: false });
+    // expo-audio exposes a module-level setAudioModeAsync (no Audio namespace).
+    if (typeof ExpoAudio.setAudioModeAsync === 'function') {
+      await ExpoAudio.setAudioModeAsync({ playsInSilentMode: true, shouldPlayInBackground: false });
+    }
     ready = true;
   } catch (e) { /* ignore */ }
 }
@@ -74,16 +79,15 @@ export function setSoundEnabled(v: boolean) { enabled = v; }
 export function setHapticsEnabled(v: boolean) { hapticsEnabled = v; }
 
 export async function play(name: SoundName) {
-  if (!enabled || !Audio) return;
+  if (!enabled || !ExpoAudio) return;
   try {
     if (!ready) await initAudio();
-    const { sound } = await Audio.Sound.createAsync(
-      { uri: TONES[name] },
-      { shouldPlay: true, volume: 0.7 },
-    );
-    sound.setOnPlaybackStatusUpdate((st: any) => {
-      if (st.didJustFinish) sound.unloadAsync().catch(() => {});
-    });
+    // createAudioPlayer(source) returns a player; play() starts it. Each call
+    // is fire-and-forget — release shortly after the tone's duration.
+    const player = ExpoAudio.createAudioPlayer({ uri: TONES[name] });
+    player.volume = 0.7;
+    player.play();
+    setTimeout(() => { try { player.remove(); } catch (e) { /* ignore */ } }, 1200);
   } catch (e) { /* ignore */ }
 }
 
