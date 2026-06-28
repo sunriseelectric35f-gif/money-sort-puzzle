@@ -51,6 +51,37 @@ jobs:
         run: |
           pod install --repo-update 2>&1 | tail -20
 
+      # SDK56 ships ExpoModulesJSI as an *always-prebuilt* Swift/C++ xcframework.
+      # Its podspec script phase runs a nested `xcodebuild build -quiet` DURING
+      # `xcodebuild archive`; that nested build is fragile (relies on resolved
+      # SPM/cache state) and `-quiet` hides the real compile error behind a bare
+      # "ARCHIVE FAILED" (exit 65). We defuse this by building the device slice
+      # HERE, in its own step, with `-quiet` stripped so any genuine error is
+      # visible. The script hashes its inputs, so the archive's script phase then
+      # finds the slice up-to-date and becomes a no-op — removing archive-time
+      # fragility entirely.
+      - name: Prebuild ExpoModulesJSI xcframework (verbose, device slice)
+        working-directory: ios
+        run: |
+          set -eo pipefail
+          JSI="../node_modules/expo-modules-jsi/apple"
+          SCRIPT="$JSI/scripts/build-xcframework.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::notice::ExpoModulesJSI build script not present — skipping prebuild"
+            exit 0
+          fi
+          # Strip `-quiet` from the nested xcodebuild so real errors surface.
+          sed -i.bak '/^[[:space:]]*-quiet \\$/d' "$SCRIPT"
+          echo "Building ExpoModulesJSI device slice (iphoneos)…"
+          PODS_ROOT="$(pwd)/Pods" PLATFORM_NAME=iphoneos \
+            DEVELOPER_DIR="$(xcode-select -p)" \
+            bash "$SCRIPT" 2>&1 | tee /tmp/jsi-build.log || {
+              echo "::error::ExpoModulesJSI xcframework prebuild failed — real compiler error is above (no longer hidden by -quiet)"
+              exit 1
+            }
+          echo "=== built slices ==="
+          ls -la "$JSI/Products/ExpoModulesJSI.xcframework" 2>&1 || true
+
       - name: Build unsigned IPA (xcodebuild)
         run: |
           set -eo pipefail
