@@ -18,8 +18,12 @@ def top_run(w):
 def uniform(w):
     return len(w) <= 1 or all(x == w[0] for x in w)
 
-def is_win(state):
-    return all(uniform(list(w)) for w in state)
+def complete(w, cap):
+    # Ball-sort: a wallet is done iff empty OR full of a single denomination.
+    return len(w) == 0 or (len(w) == cap and all(x == w[0] for x in w))
+
+def is_win(state, cap):
+    return all(complete(list(w), cap) for w in state)
 
 def legal_moves(state, cap):
     moves = []
@@ -54,7 +58,7 @@ def apply_move(state, i, j, cap):
 
 def bfs_solve(state, cap, node_cap=400000):
     """Return shortest solution length, or None if unsolvable within budget."""
-    if is_win(state): return 0
+    if is_win(state, cap): return 0
     start = state
     seen = {start}
     q = deque([(start, 0)])
@@ -67,7 +71,7 @@ def bfs_solve(state, cap, node_cap=400000):
         for (i, j) in legal_moves(cur, cap):
             nxt = apply_move(cur, i, j, cap)
             if nxt in seen: continue
-            if is_win(nxt):
+            if is_win(nxt, cap):
                 return d + 1
             seen.add(nxt)
             q.append((nxt, d + 1))
@@ -103,7 +107,7 @@ def main():
         best = None
         for _attempt in range(400):
             board = gen_board(K, C, F, rng)
-            if is_win(board):
+            if is_win(board, C):
                 continue
             par = bfs_solve(board, C)
             if par is not None and par >= 3:
@@ -114,7 +118,7 @@ def main():
             K2, C2, F2 = max(2, K - 1), C, F + 1
             while best is None:
                 board = gen_board(K2, C2, F2, rng)
-                if is_win(board): continue
+                if is_win(board, C2): continue
                 par = bfs_solve(board, C2)
                 if par is not None and par >= 3:
                     best = (board, par); C = C2

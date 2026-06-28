@@ -216,7 +216,9 @@ function serialize(s: SState): string {
   return s.map(w => w.join(',')).sort().join('|');
 }
 function sWin(s: SState, cap: number): boolean {
-  return s.every(w => w.length === 0 || (w.every(n => n === w[0]) && w.length <= cap));
+  // Ball-sort win: each wallet empty OR full of a single denomination.
+  // A partial-uniform wallet (color split across tubes) is NOT solved.
+  return s.every(w => w.length === 0 || (w.length === cap && w.every(n => n === w[0])));
 }
 function sLegal(s: SState, cap: number): Array<[number, number]> {
   const moves: Array<[number, number]> = [];
